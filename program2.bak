@@ -1,0 +1,253 @@
+#lang racket
+
+; Simple Parser for a Calculator-like Programming Language
+; EBNF Grammar:
+; program -> {stmt_list} $$
+; stmt_list -> stmt stmt_list | epsilon
+; stmt -> id = expr; | if (expr) stmt_list endif; | read id; | write expr;
+; expr -> id etail | num etail
+; etail -> + expr | - expr | compare expr | epsilon
+; id -> [a-zA-Z]+
+; num -> numsign digit digit*
+; numsign -> + | - | epsilon
+; compare -> < | <= | > | >= | == | !=
+
+; Global variables
+(define tokens '())
+(define line-num 1)
+(define parse-tree '())
+
+; Reads a file into a list of tokens
+(define (tokenize filename)
+  (define (tokenize-helper port)
+    (let ((char (read-char port)))
+      (cond
+        [(eof-object? char) '()]
+        [(char-whitespace? char)
+         (cond
+           [(char=? char #\newline) 
+            (set! line-num (add1 line-num))
+            (tokenize-helper port)]
+           [else (tokenize-helper port)])]
+        [(char-alphabetic? char)
+         (let ((id (get-identifier char port)))
+           (cons id (tokenize-helper port)))]
+        [(char-numeric? char)
+         (let ((num (get-number char port)))
+           (cons num (tokenize-helper port)))]
+        [(char=? char #\+) (cons "+" (tokenize-helper port))]
+        [(char=? char #\-) (cons "-" (tokenize-helper port))]
+        [(char=? char #\=) 
+         (let ((next-char (peek-char port)))
+           (if (char=? next-char #\=)
+               (begin
+                 (read-char port)
+                 (cons "==" (tokenize-helper port)))
+               (cons "=" (tokenize-helper port))))]
+        [(char=? char #\<) 
+         (let ((next-char (peek-char port)))
+           (if (char=? next-char #\=)
+               (begin
+                 (read-char port)
+                 (cons "<=" (tokenize-helper port)))
+               (cons "<" (tokenize-helper port))))]
+        [(char=? char #\>) 
+         (let ((next-char (peek-char port)))
+           (if (char=? next-char #\=)
+               (begin
+                 (read-char port)
+                 (cons ">=" (tokenize-helper port)))
+               (cons ">" (tokenize-helper port))))]
+        [(char=? char #\!)
+         (let ((next-char (peek-char port)))
+           (if (char=? next-char #\=)
+               (begin
+                 (read-char port)
+                 (cons "!=" (tokenize-helper port)))
+               (cons "!" (tokenize-helper port))))]
+        [(char=? char #\() (cons "(" (tokenize-helper port))]
+        [(char=? char #\)) (cons ")" (tokenize-helper port))]
+        [(char=? char #\;) (cons ";" (tokenize-helper port))]
+        [(char=? char #\$) 
+         (let ((next-char (peek-char port)))
+           (if (char=? next-char #\$)
+               (begin
+                 (read-char port)
+                 (cons "$$" (tokenize-helper port)))
+               (cons "$" (tokenize-helper port))))]
+        [else (cons (string char) (tokenize-helper port))]))))
+  
+  (define (get-identifier first-char port)
+    (define (collect-chars chars)
+      (let ((c (peek-char port)))
+        (if (and (not (eof-object? c)) (char-alphabetic? c))
+            (begin
+              (read-char port)
+              (collect-chars (cons c chars)))
+            (list->string (reverse chars)))))
+    (collect-chars (list first-char)))
+  
+  (define (get-number first-char port)
+    (define (collect-digits digits)
+      (let ((c (peek-char port)))
+        (if (and (not (eof-object? c)) (char-numeric? c))
+            (begin
+              (read-char port)
+              (collect-digits (cons c digits)))
+            (list->string (reverse digits)))))
+    (collect-digits (list first-char)))
+
+  (set! line-num 1)
+  (call-with-input-file filename tokenize-helper))
+
+; Helper functions for parsing
+(define (current-token)
+  (if (null? tokens)
+      #f
+      (car tokens)))
+
+(define (match expected-token)
+  (if (equal? (current-token) expected-token)
+      (begin
+        (set! tokens (cdr tokens))
+        #t)
+      #f))
+
+(define (expect expected-token)
+  (if (match expected-token)
+      #t
+      (error (format "Expected ~a but got ~a at line ~a" expected-token (current-token) line-num))))
+
+; Parsing functions for each non-terminal in the grammar
+(define (parse-program)
+  (let ((tree (parse-stmt-list)))
+    (expect "$$")
+    (if (null? tokens)
+        (cons 'PROGRAM tree)
+        (error (format "Expected end of file but found more tokens at line ~a" line-num)))))
+
+(define (parse-stmt-list)
+  (if (or (null? tokens) 
+          (equal? (current-token) "endif") 
+          (equal? (current-token) "$$"))
+      '() ; epsilon production
+      (let ((stmt (parse-stmt)))
+        (cons stmt (parse-stmt-list)))))
+
+(define (parse-stmt)
+  (cond
+    ; id = expr;
+    [(char-alphabetic? (string-ref (current-token) 0))
+     (let ((id (current-token)))
+       (set! tokens (cdr tokens))
+       (expect "=")
+       (let ((expr (parse-expr)))
+         (expect ";")
+         (list 'ASSIGN id expr)))]
+    
+    ; if (expr) stmt_list endif;
+    [(equal? (current-token) "if")
+     (set! tokens (cdr tokens))
+     (expect "(")
+     (let ((condition (parse-expr)))
+       (expect ")")
+       (let ((body (parse-stmt-list)))
+         (expect "endif")
+         (expect ";")
+         (list 'IF condition body)))]
+    
+    ; read id;
+    [(equal? (current-token) "read")
+     (set! tokens (cdr tokens))
+     (let ((id (current-token)))
+       (if (char-alphabetic? (string-ref id 0))
+           (begin
+             (set! tokens (cdr tokens))
+             (expect ";")
+             (list 'READ id))
+           (error (format "Expected identifier but got ~a at line ~a" id line-num))))]
+    
+    ; write expr;
+    [(equal? (current-token) "write")
+     (set! tokens (cdr tokens))
+     (let ((expr (parse-expr)))
+       (expect ";")
+       (list 'WRITE expr))]
+    
+    [else (error (format "Invalid statement at line ~a, got: ~a" line-num (current-token)))]))
+
+(define (parse-expr)
+  (cond
+    ; expr -> id etail
+    [(and (not (null? tokens)) (char-alphabetic? (string-ref (current-token) 0)))
+     (let ((id (current-token)))
+       (set! tokens (cdr tokens))
+       (let ((etail (parse-etail)))
+         (if etail
+             (list 'EXPR id etail)
+             (list 'EXPR id))))]
+    
+    ; expr -> num etail
+    [(and (not (null? tokens)) 
+          (or (char-numeric? (string-ref (current-token) 0))
+              (and (> (string-length (current-token)) 1)
+                   (or (equal? (substring (current-token) 0 1) "+")
+                       (equal? (substring (current-token) 0 1) "-"))
+                   (char-numeric? (string-ref (current-token) 1)))))
+     (let ((num (current-token)))
+       (set! tokens (cdr tokens))
+       (let ((etail (parse-etail)))
+         (if etail
+             (list 'EXPR num etail)
+             (list 'EXPR num))))]
+    
+    [else (error (format "Expected id or num but got ~a at line ~a" (current-token) line-num))]))
+
+(define (parse-etail)
+  (cond
+    ; etail -> + expr
+    [(equal? (current-token) "+")
+     (set! tokens (cdr tokens))
+     (let ((expr (parse-expr)))
+       (list 'PLUS expr))]
+    
+    ; etail -> - expr
+    [(equal? (current-token) "-")
+     (set! tokens (cdr tokens))
+     (let ((expr (parse-expr)))
+       (list 'MINUS expr))]
+    
+    ; etail -> compare expr
+    [(member (current-token) '("<" "<=" ">" ">=" "==" "!="))
+     (let ((comp (parse-compare)))
+       (let ((expr (parse-expr)))
+         (list comp expr)))]
+    
+    ; etail -> epsilon
+    [else #f]))
+
+(define (parse-compare)
+  (let ((token (current-token)))
+    (set! tokens (cdr tokens))
+    (cond
+      [(equal? token "<") 'LESS-THAN]
+      [(equal? token "<=") 'LESS-EQUAL]
+      [(equal? token ">") 'GREATER-THAN]
+      [(equal? token ">=") 'GREATER-EQUAL]
+      [(equal? token "==") 'EQUAL]
+      [(equal? token "!=") 'NOT-EQUAL]
+      [else (error (format "Invalid comparison operator: ~a at line ~a" token line-num))])))
+
+; Main parsing function
+(define (parse filename)
+  (set! tokens (tokenize filename))
+  (set! parse-tree '())
+  (with-handlers ([exn:fail? (lambda (e) 
+                               (format "Syntax error at line ~a: ~a" 
+                                       line-num 
+                                       (exn-message e)))])
+    (set! parse-tree (parse-program))
+    (format "Accept\n~a" parse-tree)))
+
+; Export the parse function
+(provide parse)
